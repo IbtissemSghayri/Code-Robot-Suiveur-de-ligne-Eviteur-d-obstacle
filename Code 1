@@ -1,0 +1,218 @@
+#include <Servo.h>
+
+// ===== CONFIGURATION CAPTEURS IR (Passage en Analogique) =====
+#define NUM_SENSORS 8
+byte sensorPins[NUM_SENSORS] = {A0, A1, A2, A3, A4, A5, A6, A7}; // DOIT ETRE SUR A0-A7
+int weights[NUM_SENSORS] = {-3500, -2500, -1500, -500, 500, 1500, 2500, 3500};
+
+// Tableaux pour la calibration
+int sensorMin[NUM_SENSORS];
+int sensorMax[NUM_SENSORS];
+int threshold[NUM_SENSORS];
+
+// ===== CONFIGURATION MOTEURS L298N =====
+byte ENA = 4;
+byte IN1 = 22;
+byte IN2 = 23;
+byte ENB = 5;
+byte IN3 = 24;
+byte IN4 = 25;
+
+// ===== CAPTEUR ULTRASON HC-SR04 =====
+byte trigPin = 9;
+byte echoPin = 8;
+unsigned long lastSonarTime = 0; 
+long currentDistance = 999;      
+
+// ===== SERVO MOTEUR =====
+Servo radar;
+byte servoPin = 38;
+
+// ===== PARAMÈTRES PID (Multipliés par 100) =====
+long Kp = 16;  
+long Ki = 0;
+long Kd = 40; // ASTUCE : Passe à 40 ou 50 si le robot ne braque pas assez vite sur le 90°
+
+long error = 0;
+long lastError = 0;
+long integral = 0;
+int baseSpeed = 60; // ASTUCE : Baisse à 70 ou 80 pour tes premiers tests sur les angles droits
+
+// ===== MÉMOIRE POUR GRAND VIRAGE =====
+long lastPosition = 0; 
+
+// ====================== FONCTIONS ======================
+
+void calibrateSensors() {
+  // Initialisation des valeurs min et max
+  for (byte i = 0; i < NUM_SENSORS; i++) {
+    sensorMin[i] = 1023;
+    sensorMax[i] = 0;
+  }
+
+  // Boucle de calibration (~4 secondes)
+  // PENDANT CE TEMPS : Fais glisser le robot de gauche à droite sur la ligne noire et le fond blanc
+  for (int i = 0; i < 400; i++) {
+    for (byte j = 0; j < NUM_SENSORS; j++) {
+      int val = analogRead(sensorPins[j]);
+      if (val < sensorMin[j]) sensorMin[j] = val; 
+      if (val > sensorMax[j]) sensorMax[j] = val; 
+    }
+    delay(10);
+  }
+
+  // Calcul du seuil moyen pour chaque capteur
+  for (byte i = 0; i < NUM_SENSORS; i++) {
+    threshold[i] = (sensorMin[i] + sensorMax[i]) / 2;
+  }
+}
+
+long readDistance() {
+  digitalWrite(trigPin, LOW);
+  delayMicroseconds(2);
+  digitalWrite(trigPin, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(trigPin, LOW);
+
+  long duration = pulseIn(echoPin, HIGH, 5000); 
+  if (duration == 0) return 999; 
+  return duration * 0.034 / 2;
+}
+
+long readLine() {
+  long sum = 0;
+  byte active = 0; 
+  bool extremeLeft = false;
+  bool extremeRight = false;
+
+  for(byte i = 0; i < NUM_SENSORS; i++){
+    int sensorValue = analogRead(sensorPins[i]);
+    
+    // Si la valeur lue dépasse le seuil calculé, on considère que le capteur voit la ligne
+    // NOTE: Si ton robot réagit à l'envers, change le '>' en '<'
+    if(sensorValue > threshold[i]){ 
+      sum += weights[i];
+      active++;
+
+      // On repère si la ligne touche les capteurs des extrémités
+      if(i == 0 || i == 1) extremeLeft = true;
+      if(i == 6 || i == 7) extremeRight = true;
+    }
+  }
+
+  // --- NOUVEAU : Logique spéciale Virage 90° ---
+  // Si la ligne est vue par au moins 3 capteurs (ligne horizontale)
+  // et qu'elle touche une extrémité, on force une erreur maximale !
+  if (active >= 3) {
+    if (extremeRight && !extremeLeft) {
+      lastPosition = 4500; // Mémorise qu'on va fortement à droite
+      return 4500;         // Force un braquage à droite
+    }
+    if (extremeLeft && !extremeRight) {
+      lastPosition = -4500; // Mémorise qu'on va fortement à gauche
+      return -4500;         // Force un braquage à gauche
+    }
+  }
+
+  // Gestion des sorties de ligne (le robot a dépassé la ligne)
+  if(active == 0) {
+    if(lastPosition > 0) return 4500; 
+    else if(lastPosition < 0) return -4500; 
+    else return 0;
+  }
+
+  // Comportement normal (suivi de ligne fluide par le PID)
+  lastPosition = sum / active;
+  return lastPosition;
+}
+
+void motorLeft(int speed){
+  if(speed >= 0){
+    digitalWrite(IN1, HIGH);
+    digitalWrite(IN2, LOW);
+  } else {
+    digitalWrite(IN1, LOW);
+    digitalWrite(IN2, HIGH);
+    speed = -speed;
+  }
+  analogWrite(ENA, constrain(speed, 0, 255));
+}
+
+void motorRight(int speed){
+  if(speed >= 0){
+    digitalWrite(IN3, HIGH);
+    digitalWrite(IN4, LOW);
+  } else {
+    digitalWrite(IN3, LOW);
+    digitalWrite(IN4, HIGH);
+    speed = -speed;
+  }
+  analogWrite(ENB, constrain(speed, 0, 255));
+}
+
+void avoidObstacle(){
+  motorLeft(0); motorRight(0); delay(200);
+  motorLeft(150); motorRight(-150); delay(350); 
+  motorLeft(60); motorRight(60); delay(300); 
+  motorLeft(-150); motorRight(150); delay(350); 
+  motorLeft(200); motorRight(200); delay(400); 
+}
+
+// ====================== SETUP ======================
+void setup(){
+  Serial.begin(9600);
+
+  pinMode(IN1, OUTPUT); pinMode(IN2, OUTPUT);
+  pinMode(IN3, OUTPUT); pinMode(IN4, OUTPUT);
+  pinMode(ENA, OUTPUT); pinMode(ENB, OUTPUT);
+  pinMode(trigPin, OUTPUT); pinMode(echoPin, INPUT);
+
+  radar.attach(servoPin); 
+  radar.write(90);
+
+  // Lancement de la calibration au démarrage
+  Serial.println("Début calibration... BOUGEZ LE ROBOT SUR LA LIGNE !");
+  calibrateSensors();
+  Serial.println("Calibration terminée !");
+  
+  // Petite pause pour te laisser poser le robot avant qu'il ne fonce
+  delay(2000); 
+}
+
+// ====================== LOOP ======================
+void loop(){
+  // 1. Ultrason toutes les 50ms
+  if (millis() - lastSonarTime >= 50) {
+    currentDistance = readDistance();
+    lastSonarTime = millis();
+  }
+
+  // 2. Évitement
+  if(currentDistance > 0 && currentDistance < 25){
+    avoidObstacle();
+    integral = 0; 
+    lastError = 0;
+    currentDistance = 999; 
+    return; 
+  }
+
+  // 3. Lecture Ligne avec les seuils calibrés et détection 90°
+  long position = readLine();
+
+  // 4. Calcul PID
+  error = position;
+  integral += error;
+  integral = constrain(integral, -10000, 10000); 
+  
+  long derivative = error - lastError;
+  
+  long correction = (Kp * error + Ki * integral + Kd * derivative) / 100;
+  
+  lastError = error;
+
+  int leftSpeed = baseSpeed + correction;
+  int rightSpeed = baseSpeed - correction;
+
+  motorLeft(leftSpeed);
+  motorRight(rightSpeed);
+}
