@@ -1,0 +1,204 @@
+#include <Arduino.h>
+
+// ==========================================
+// 1. CONFIGURATION (NANO + L298N)
+// ==========================================
+
+// --- PINS CAPTEURS ---
+// Assure-toi que les capteurs sont bien branchés dans cet ordre (Gauche -> Droite)
+const int SENSOR_PINS[8] = {A7, A6, A5, A4, A3, A2, A1, A0}; 
+const int LINE_COLOR = 0; // 1 = ligne blanche, 0 = ligne noire
+
+// --- PINS MOTEURS (L298N) ---
+const int ENA = 9;  // Moteur Gauche PWM
+const int IN1 = 3;  // Moteur Gauche Dir 1
+const int IN2 = 4;  // Moteur Gauche Dir 2
+
+const int ENB = 10;  // Moteur Droit PWM
+const int IN3 = 6;  // Moteur Droit Dir 1
+const int IN4 = 5;  // Moteur Droit Dir 2
+
+// --- PARAMÈTRES DE MARCHE ---
+const int BASE_SPEED = 120; 
+const int SEARCH_SPEED = 90; // Vitesse de rotation quand la ligne est perdue
+const int ROBOT_BALANCE = 0; // Ajuste si un moteur tourne naturellement plus vite que l'autre
+
+// --- PARAMÈTRES MPC ---
+const int HORIZON = 5;
+const float DT = 0.02; // Boucle fixée à 20ms (0.02s)
+const float WEIGHT_ERROR = 20.0; // Poids donné au recentrage sur la ligne
+const float WEIGHT_CONTROL = 1.5; // Poids donné à la douceur de la direction
+
+// ==========================================
+// 2. VARIABLES GLOBALES ET ÉTATS
+// ==========================================
+float current_error = 0;
+int active_sensors = 0;
+bool left_wing = false;
+bool right_wing = false;
+
+// Gestion du temps (remplace les delay)
+unsigned long last_loop_time = 0;
+unsigned long turn_start_time = 0;
+const unsigned long TURN_DURATION = 150; // Durée du virage forcé en ms
+
+// Machine à états
+enum RobotState {
+  FOLLOWING,
+  TURNING_RIGHT,
+  SEARCHING
+};
+RobotState currentState = FOLLOWING;
+
+// ==========================================
+// 3. FONCTIONS MOTEURS & CAPTEURS
+// ==========================================
+
+void setMotors(int speedL, int speedR) {
+  // Application de la balance
+  speedL -= ROBOT_BALANCE;
+  speedR += ROBOT_BALANCE;
+
+  // Sécurité pour ne pas dépasser les limites PWM
+  speedL = constrain(speedL, -255, 255);
+  speedR = constrain(speedR, -255, 255);
+
+  // Moteur Gauche
+  if (speedL >= 0) {
+    digitalWrite(IN1, HIGH); digitalWrite(IN2, LOW);
+  } else {
+    digitalWrite(IN1, LOW); digitalWrite(IN2, HIGH);
+    speedL = -speedL;
+  }
+  analogWrite(ENA, speedL);
+
+  // Moteur Droit
+  if (speedR >= 0) {
+    digitalWrite(IN3, HIGH); digitalWrite(IN4, LOW);
+  } else {
+    digitalWrite(IN3, LOW); digitalWrite(IN4, HIGH);
+    speedR = -speedR;
+  }
+  analogWrite(ENB, speedR);
+}
+
+void readSensors() {
+  int numerator = 0;
+  active_sensors = 0;
+  
+  for(int i = 0; i < 8; i++) {
+    if(digitalRead(SENSOR_PINS[i]) == LINE_COLOR) { 
+      numerator += (i * 10) - 35; // Centré sur 0
+      active_sensors++;
+    }
+  }
+
+  left_wing = (digitalRead(SENSOR_PINS[0]) == LINE_COLOR);
+  right_wing = (digitalRead(SENSOR_PINS[7]) == LINE_COLOR);
+
+  if (active_sensors > 0) {
+    current_error = (float)numerator / (active_sensors * 10.0);
+  }
+}
+
+// ==========================================
+// 4. ALGORITHME MPC OPTIMISÉ
+// ==========================================
+float solveMPC(float initial_error) {
+  int best_u = 0;
+  float min_cost = 100000.0; // Valeur d'initialisation très grande
+
+  // On cherche la meilleure correction de direction (u)
+  // Utilisation d'entiers pour la boucle externe afin d'alléger le processeur
+  for (int u = -120; u <= 120; u += 20) { 
+    float predicted_error = initial_error;
+    float cost = 0;
+    
+    // Pré-calcul pour éviter la multiplication répétée dans la boucle HORIZON
+    float u_dt = (float)u * DT; 
+    
+    for (int k = 0; k < HORIZON; k++) {
+      predicted_error += u_dt; 
+      // Calcul du coût : Erreur au carré (pénalise fortement les grands écarts) + effort de contrôle
+      cost += (WEIGHT_ERROR * (predicted_error * predicted_error)) + (WEIGHT_CONTROL * abs(u));
+    }
+    
+    if (cost < min_cost) {
+      min_cost = cost;
+      best_u = u;
+    }
+  }
+  return (float)best_u;
+}
+
+// ==========================================
+// 5. SETUP & LOOP
+// ==========================================
+
+void setup() {
+  Serial.begin(115200);
+  
+  // Initialisation des capteurs
+  for(int i=0; i<8; i++) {
+    pinMode(SENSOR_PINS[i], INPUT);
+  }
+  
+  // Initialisation du L298N
+  pinMode(ENA, OUTPUT); pinMode(IN1, OUTPUT); pinMode(IN2, OUTPUT);
+  pinMode(ENB, OUTPUT); pinMode(IN3, OUTPUT); pinMode(IN4, OUTPUT);
+  
+  // Attente avant le départ pour avoir le temps de poser le robot
+  delay(2000); 
+}
+
+void loop() {
+  unsigned long current_time = millis();
+
+  // Fréquence d'exécution stricte (20ms) dictée par notre DT du MPC
+  if (current_time - last_loop_time >= (DT * 1000)) {
+    last_loop_time = current_time;
+    
+    readSensors();
+
+    // ==========================================
+    // LOGIQUE DE DÉCISION (MACHINE À ÉTATS)
+    // ==========================================
+    switch (currentState) {
+      
+      case FOLLOWING:
+        // Si le robot voit une intersection à droite (Priorité)
+        if (right_wing && active_sensors >= 3) {
+          currentState = TURNING_RIGHT;
+          turn_start_time = current_time; // On mémorise le début du virage
+        } 
+        // Si le robot perd totalement la ligne
+        else if (active_sensors == 0) {
+          currentState = SEARCHING;
+        } 
+        // Suivi normal avec le MPC
+        else {
+          float correction = solveMPC(current_error);
+          setMotors(BASE_SPEED + (int)correction, BASE_SPEED - (int)correction);
+        }
+        break;
+
+      case TURNING_RIGHT:
+        // Exécute le virage à droite
+        setMotors(BASE_SPEED, -50); 
+        // Une fois le temps écoulé, on repasse en suivi normal
+        if (current_time - turn_start_time >= TURN_DURATION) {
+          currentState = FOLLOWING;
+        }
+        break;
+
+      case SEARCHING:
+        // Tourne sur lui-même pour retrouver la ligne
+        setMotors(SEARCH_SPEED, -SEARCH_SPEED);
+        // S'il capte à nouveau la ligne, il reprend son chemin
+        if (active_sensors > 0) {
+          currentState = FOLLOWING;
+        }
+        break;
+    }
+  }
+}
